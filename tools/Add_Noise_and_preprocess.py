@@ -358,9 +358,9 @@ def main():
             h = int(zlib.crc32(key) & 0xFFFFFFFF)
             rng_win = np.random.default_rng(int((seed + noise_seed_offset + h) % (2**32 - 1)))
             
-            win_clean = win_raw - sess.earth_raw
+            win_noisy = win_raw - sess.earth_raw
             
-            synth_noise = generate_local_synthetic_noise(win_clean, fs=fs, rng=rng_win, window_len=window_len)
+            synth_noise = generate_local_synthetic_noise(win_noisy, fs=fs, rng=rng_win, window_len=window_len)
             win_noisy_raw = win_raw + synth_noise
             
             clean_norm = ((win_raw - mean) / (std + 1e-12)).T.astype(np.float32) 

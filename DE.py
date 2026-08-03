@@ -84,6 +84,9 @@ def get_fixed_complementary_masks(batch_size, seq_len, patch_size):
 
 
 
+def _expand_mask(mask, patch_size):
+    # [B, n_patches] -> [B, 1, L]
+    return mask.repeat_interleave(patch_size, dim=1).unsqueeze(1).to(mask.device)
 
 
 #####################################
@@ -152,7 +155,11 @@ class DualMaskMAE(nn.Module):
 
         # --- NEW ADD ---
         # Learnable Convolutional Fusion Head to stitch patch boundaries smoothly
-        self.fusion_conv = nn.Conv1d(in_channels=in_chans * 2, out_channels=in_chans, kernel_size=5, padding=2)
+        #self.fusion_conv = nn.Conv1d(in_channels=in_chans * 2, out_channels=in_chans, kernel_size=5, padding=2)
+        
+        self.fusion_conv = nn.Conv1d(in_chans, in_chans, kernel_size=5, padding=2)
+        nn.init.zeros_(self.fusion_conv.weight)
+        nn.init.zeros_(self.fusion_conv.bias)
         # -----------------------
 
         self.initialize_weights()
@@ -251,13 +258,8 @@ class DualMaskMAE(nn.Module):
         # ==========================================================
         # 2. INFERENCE MASK ZEROING (Eliminates PSD Comb Filter)
         # ==========================================================
-        if self.training:
-            # Alternating complementary masks for training
-            mask_A, mask_B = get_fixed_complementary_masks(B, L, self.patch_size)
-        else:
-            # Pass 100% of tokens to the encoder during inference
-            mask_A = torch.zeros(B, L // self.patch_size, dtype=torch.float32)
-            mask_B = torch.zeros(B, L // self.patch_size, dtype=torch.float32)
+        # Alternating complementary masks for training
+        mask_A, mask_B = get_fixed_complementary_masks(B, L, self.patch_size)
 
         mask_A = mask_A.to(x_noisy.device)
         mask_B = mask_B.to(x_noisy.device)
@@ -300,19 +302,21 @@ class DualMaskMAE(nn.Module):
         # ==========================================================
         # 3. FUSION & EXACT DC RESTORATION
         # ==========================================================
-        if self.training:
-            # Network learns to blend boundaries during 50% mask training
-            y_concat = torch.cat([y1, y2], dim=1)
-            y_pred = self.fusion_conv(y_concat)
-        else:
-            # At inference, mask=0 means y1 is a perfect 100% representation
-            y_pred = y1
+        # Network learns to blend boundaries during 50% mask training
+        m_A = _expand_mask(mask_A, self.patch_size).to(y1.dtype)
+        m_B = _expand_mask(mask_B, self.patch_size).to(y1.dtype)
+
+        # masks are complementary, so this covers every sample exactly once,
+        # and every sample comes from a branch that could not see it
+        y_blind = m_A * y1 + m_B * y2
+
+        y_final = y_blind + self.fusion_conv(y_blind)   # residual boundary smoother
+      
         
         # Restore the exact input mean (Mathematically guarantees 0 heading drift)
         #y_final = y_pred - y_pred.mean(dim=2, keepdim=True) + x_mean
         x_mean = x_clean.mean(dim=2, keepdim=True)
         y_final = y_pred - y_pred.mean(dim=2, keepdim=True) + x_mean
-
         # ==========================================================
         # 4. LOSS CALCULATION
         # ==========================================================
@@ -321,15 +325,12 @@ class DualMaskMAE(nn.Module):
             loss_recon = torch.mean(diff ** 2)
             
             # Boundary Loss: explicitly smooths the 3.125 Hz patch jumps
-            if self.training:
-                boundary_left = torch.arange(self.patch_size - 1, L - 1, self.patch_size, device=y_final.device)
-                boundary_right = boundary_left + 1
-                left_edges = y_final[:, :, boundary_left]
-                right_edges = y_final[:, :, boundary_right]
-                loss_boundary = torch.mean((left_edges - right_edges) ** 2)
-                loss = loss_recon + (0.1 * loss_boundary)
-            else:
-                loss = loss_recon
+            boundary_left = torch.arange(self.patch_size - 1, L - 1, self.patch_size, device=y_final.device)
+            boundary_right = boundary_left + 1
+            left_edges = y_final[:, :, boundary_left]
+            right_edges = y_final[:, :, boundary_right]
+            loss_boundary = torch.mean((left_edges - right_edges) ** 2)
+            loss = loss_recon + (0.1 * loss_boundary)
 
             if omega_target is not None:
                 omega_pred = torch.mean(y_final, dim=2)               
