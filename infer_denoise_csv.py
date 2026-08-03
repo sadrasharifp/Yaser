@@ -264,7 +264,7 @@ def denoise_stream_overlap_add(
         batch = np.stack([x_pad[s : s + window_len] for s in batch_starts], axis=0)  # [B,L,C]
         t = torch.from_numpy(batch).float().permute(0, 2, 1).to(device)  # [B,C,L]
         # DE forward signature is (x_noisy, x_clean). For inference, pass x as both.
-        _, y, _ = model(t, t)
+        _, y, _, _ = model(t, t)
         y = y.detach().cpu().numpy().astype(np.float64).transpose(0, 2, 1)  # [B,L,C]
 
         for b, s in enumerate(batch_starts):

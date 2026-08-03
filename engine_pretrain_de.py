@@ -36,19 +36,21 @@ def train_one_epoch_de(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples_noisy, samples_clean, omega_target) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples_mix, samples_clean, omega_target, accel_win) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples_noisy = samples_noisy.to(device, non_blocking=True)
+        samples_mix = samples_mix.to(device, non_blocking=True)
         samples_clean = samples_clean.to(device, non_blocking=True)
         omega_target = omega_target.to(device, non_blocking=True)
+        accel_win = accel_win.to(device, non_blocking=True)
 
-        #with torch.cuda.amp.autocast():
-        with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-            loss, _, _ = model(samples_noisy, samples_clean, omega_target)
+        # Conditionally enable autocast only if we are on a CUDA device
+        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            loss, _, _, loss_parts = model(samples_mix, samples_clean, omega_target, accel_win)
 
         loss_value = loss.item()
 
@@ -61,10 +63,15 @@ def train_one_epoch_de(model: torch.nn.Module,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
+
+        # Only synchronize if a CUDA device is being used
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
+        for k, v in loss_parts.items():
+            if v is not None:
+                metric_logger.update(**{k: v.item()})
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
@@ -116,6 +123,8 @@ def get_random_mask_half(batch_size, seq_len, patch_size, device=None):
         mask[b, mask_indices] = 1.0
 
     return mask
+
+
 def train_one_epoch_r(
     model: torch.nn.Module,
     data_loader: Iterable,
@@ -126,7 +135,6 @@ def train_one_epoch_r(
     log_writer=None,
     args=None
 ):
-
 
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -141,7 +149,7 @@ def train_one_epoch_r(
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples_noisy, samples_clean) in enumerate(
+    for data_iter_step, (samples_mix, samples_clean) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
         # --- Adjust learning rate per iteration (if this is your intended schedule) ---
@@ -152,20 +160,20 @@ def train_one_epoch_r(
                 args
             )
 
-        samples_noisy = samples_noisy.to(device, non_blocking=True)
+        samples_mix = samples_mix.to(device, non_blocking=True)
         samples_clean = samples_clean.to(device, non_blocking=True)
 
         # ============ Generate a random mask (once per iteration) ============
-        B = samples_noisy.size(0)
-        seq_len = 256     # sequence length
+        B = samples_mix.size(0)
+        seq_len = 256    # sequence length
         patch_size = 2    # patch size
         # Note: model(...) must support mask=... if you use this training variant.
         mask = get_random_mask_half(B, seq_len, patch_size, device=device)
 
         # ============ Forward pass with mask ============
-        #with torch.cuda.amp.autocast():
-        with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-            loss, _, _ = model(samples_noisy, samples_clean, mask=mask)
+        # Conditionally enable autocast only if we are on a CUDA device
+        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            loss, _, _ = model(samples_mix, samples_clean, mask=mask)
             # Ensure your model forward supports mask=...
 
         loss_value = loss.item()
@@ -184,6 +192,7 @@ def train_one_epoch_r(
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
+        # Only synchronize if a CUDA device is being used
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
